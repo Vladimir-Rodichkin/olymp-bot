@@ -32,9 +32,11 @@ from telegram.ext import (
     filters,
 )
 from telegram.error import Conflict, Forbidden, BadRequest
+import asyncio
+from datetime import datetime, date, time, timedelta
 
 #Конфигурация
-TELEGRAM_TOKEN    = 'TOKEN'
+TELEGRAM_TOKEN    = ''
 EXCEL_FILE        = "Список олимпиад.xlsx"
 DB_FILE           = 'subscriptions.db'
 TIMEZONE            = ZoneInfo('Europe/Moscow')
@@ -64,6 +66,7 @@ ADMIN_IDS           = {}
 UD_LIST_ROOT_ID     = 'list_root_msg_id'
 UD_LIST_EXTRA_IDS   = 'list_message_ids'
 UD_AWAIT_BROADCAST  = 'await_broadcast_text'
+UD_ACTIVE_MSG_ID = 'active_msg_id'
 
 #ВСПОМОГАТЕЛЬНОЕ
 def detect_col(df: pd.DataFrame, keywords) -> Optional[str]:
@@ -116,6 +119,7 @@ def parse_dates_from_cell(cell: str, today: date) -> List[Tuple[date, str]]:
         else:
             left, label = entry, 'событие'
 
+        # "с 12.09 по 14.09"
         if 'с ' in left.lower() and ' по ' in left.lower():
             m = DATE_RE.findall(left)
             if m:
@@ -130,6 +134,7 @@ def parse_dates_from_cell(cell: str, today: date) -> List[Tuple[date, str]]:
                     pass
             continue
 
+        # диапазон "12.11–14.11(.2025)"
         if RANGE_SEP_RE.search(left):
             sides = RANGE_SEP_RE.split(left)
             if sides:
@@ -171,7 +176,7 @@ def next_upcoming_from_cell(cell: str, today: date) -> Optional[Tuple[date, str]
     items = parse_dates_from_cell(cell, today)
     return items[0] if items else None
 
-#БАЗА ДАННЫХ
+# ===================== БАЗА ДАННЫХ =====================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -222,7 +227,7 @@ def get_all_user_ids() -> set[int]:
     conn.close()
     return a | b
 
-#ЧТЕНИЕ EXCEL
+# ===================== ЧТЕНИЕ EXCEL =====================
 def fetch_olympiads():
     df = pd.read_excel(EXCEL_FILE, sheet_name=0)
 
@@ -252,7 +257,7 @@ def fetch_olympiads():
         })
     return olympiads
 
-#УТИЛИТЫ UI
+# ===================== UI УТИЛИТЫ =====================
 def get_profiles(olys):
     s = set()
     for o in olys: s.update(o['profiles'])
@@ -281,7 +286,30 @@ def main_menu_markup():
         [InlineKeyboardButton("🗑️ Удалить подписку",  callback_data="menu_delete")],
     ])
 
-#ХЕНДЛЕРЫ МЕНЮ
+async def safe_edit_message(cb_query, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
+    """
+    Безопасное редактирование: если контент и разметка не меняются — игнорируем BadRequest: Message is not modified.
+    """
+    try:
+        msg = cb_query.message
+        if msg:
+            cur_text = msg.text or msg.caption or ""
+            same_text = (cur_text == text)
+            same_markup = (msg.reply_markup == reply_markup)
+            if same_text and same_markup:
+                await cb_query.answer("Без изменений.")
+                return None
+        return await cb_query.edit_message_text(text, reply_markup=reply_markup)
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            try:
+                await cb_query.edit_message_reply_markup(reply_markup=reply_markup)
+            except Exception:
+                pass
+            return None
+        raise
+
+# ===================== ХЕНДЛЕРЫ МЕНЮ =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user_in_db(update)
     text = (
@@ -292,14 +320,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "❗ Если обнаружили ошибку и/или хотите предложить новую идею для бота, пишите мне: @Vladimir_Rodichkin. \n\n"
         "Выберите действие:"
     )
+
     if update.callback_query:
+        # Возврат в меню по кнопке — редактируем текущее сообщение
         await update.callback_query.answer()
         cur_id = update.callback_query.message.message_id
+        context.user_data[UD_ACTIVE_MSG_ID] = cur_id
         await cleanup_list_messages(update, context, exclude_id=cur_id)
-        await update.callback_query.edit_message_text(text, reply_markup=main_menu_markup())
+        await safe_edit_message(update.callback_query, text, main_menu_markup())
     else:
+        # /start из чата — удаляем прежнее активное меню, шлём новое
+        chat_id = update.effective_chat.id
+        prev_id = context.user_data.get(UD_ACTIVE_MSG_ID)
+        if prev_id:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=prev_id)
+            except Exception:
+                pass
         await cleanup_list_messages(update, context, exclude_id=None)
-        await update.message.reply_text(text, reply_markup=main_menu_markup())
+        m = await update.message.reply_text(text, reply_markup=main_menu_markup())
+        context.user_data[UD_ACTIVE_MSG_ID] = m.message_id
 
 async def menu_back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
@@ -307,8 +347,9 @@ async def menu_back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu_select_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     cur_id = update.callback_query.message.message_id
+    context.user_data[UD_ACTIVE_MSG_ID] = cur_id
     await cleanup_list_messages(update, context, exclude_id=cur_id)
-    context.user_data.clear()
+    # НЕ чистим полностью user_data, чтобы не потерять служебные ключи
     context.user_data['olys']      = fetch_olympiads()
     context.user_data['selection'] = []
     context.user_data['chosen']    = []  # list[(o, profile)]
@@ -317,6 +358,7 @@ async def menu_select_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     cur_id = update.callback_query.message.message_id
+    context.user_data[UD_ACTIVE_MSG_ID] = cur_id
     await cleanup_list_messages(update, context, exclude_id=cur_id)
 
     olys   = fetch_olympiads()
@@ -330,9 +372,10 @@ async def menu_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     if not rows:
-        await update.callback_query.edit_message_text(
+        await safe_edit_message(
+            update.callback_query,
             "❌ У вас нет подписок.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")]])
+            InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")]])
         )
         context.user_data[UD_LIST_ROOT_ID]   = update.callback_query.message.message_id
         context.user_data[UD_LIST_EXTRA_IDS] = []
@@ -363,7 +406,7 @@ async def menu_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cur_txt.strip(): chunks.append(cur_txt.rstrip())
 
     back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")]])
-    await update.callback_query.edit_message_text(chunks[0], reply_markup=back_kb)
+    await safe_edit_message(update.callback_query, chunks[0], back_kb)
     context.user_data[UD_LIST_ROOT_ID] = update.callback_query.message.message_id
     extra_ids = []
     chat_id = update.effective_chat.id
@@ -375,15 +418,16 @@ async def menu_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu_delete_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     cur_id = update.callback_query.message.message_id
+    context.user_data[UD_ACTIVE_MSG_ID] = cur_id
     await cleanup_list_messages(update, context, exclude_id=cur_id)
     kb = [
         [InlineKeyboardButton("Удалить конкретную", callback_data="del_one")],
         [InlineKeyboardButton("Удалить по профилю", callback_data="del_profile")],
         [InlineKeyboardButton("↩️ Главное меню",    callback_data="menu_back")],
     ]
-    await update.callback_query.edit_message_text("Выберите действие для удаления:", reply_markup=InlineKeyboardMarkup(kb))
+    await safe_edit_message(update.callback_query, "Выберите действие для удаления:", InlineKeyboardMarkup(kb))
 
-#УДАЛЕНИЕ
+# ===================== УДАЛЕНИЕ =====================
 async def del_one_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     uid = update.effective_user.id
@@ -391,21 +435,28 @@ async def del_one_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("SELECT olympiad_id, olympiad_name, profile FROM subscriptions WHERE user_id = ?", (uid,))
     rows = cur.fetchall(); conn.close()
     if not rows:
-        await update.callback_query.edit_message_text("❌ Нет подписок для удаления.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")]])); return
+        await safe_edit_message(update.callback_query, "❌ Нет подписок для удаления.",
+                                InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")]]))
+        return
     context.user_data['remove'] = rows
     kb = [[InlineKeyboardButton(f"{name} ({prof})", callback_data=f"del_one_oly|{i}")] for i, (_, name, prof) in enumerate(rows)]
     kb.append([InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")])
-    await update.callback_query.edit_message_text("Что удалить?", reply_markup=InlineKeyboardMarkup(kb))
+    await safe_edit_message(update.callback_query, "Что удалить?", InlineKeyboardMarkup(kb))
 
 async def del_one_oly_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     idx  = int(update.callback_query.data.split("|",1)[1])
     rows = context.user_data.get('remove', [])
     if idx < 0 or idx >= len(rows):
-        await update.callback_query.edit_message_text("❌ Неверный выбор.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")]])); return
+        await safe_edit_message(update.callback_query, "❌ Неверный выбор.",
+                                InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")]]))
+        return
     oid, name, prof = rows[idx]
-    conn = sqlite3.connect(DB_FILE); conn.execute("DELETE FROM subscriptions WHERE user_id=? AND olympiad_id=? AND profile=?", (update.effective_user.id, oid, prof)); conn.commit(); conn.close()
-    await update.callback_query.edit_message_text(f"✅ Удалено: {name} ({prof})", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")]]))
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("DELETE FROM subscriptions WHERE user_id=? AND olympiad_id=? AND profile=?", (update.effective_user.id, oid, prof))
+    conn.commit(); conn.close()
+    await safe_edit_message(update.callback_query, f"✅ Удалено: {name} ({prof})",
+                            InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")]]))
 
 async def del_profile_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
@@ -414,23 +465,28 @@ async def del_profile_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("SELECT DISTINCT profile FROM subscriptions WHERE user_id = ?", (uid,))
     profiles = [r[0] for r in cur.fetchall()]; conn.close()
     if not profiles:
-        await update.callback_query.edit_message_text("❌ Нет подписок.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")]])); return
+        await safe_edit_message(update.callback_query, "❌ Нет подписок.",
+                                InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")]]))
+        return
     context.user_data['del_profiles'] = profiles
     kb = [[InlineKeyboardButton(prof, callback_data=f"del_profile_sel|{i}")] for i, prof in enumerate(profiles)]
     kb.append([InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")])
-    await update.callback_query.edit_message_text("Выберите профиль для удаления всех подписок:", reply_markup=InlineKeyboardMarkup(kb))
+    await safe_edit_message(update.callback_query, "Выберите профиль для удаления всех подписок:", InlineKeyboardMarkup(kb))
 
 async def del_profile_sel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     idx = int(update.callback_query.data.split("|",1)[1])
     profiles = context.user_data.get('del_profiles', [])
     if idx < 0 or idx >= len(profiles):
-        await update.callback_query.edit_message_text("❌ Неверный выбор.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")]])); return
+        await safe_edit_message(update.callback_query, "❌ Неверный выбор.",
+                                InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")]]))
+        return
     prof = profiles[idx]
     conn = sqlite3.connect(DB_FILE); conn.execute("DELETE FROM subscriptions WHERE user_id=? AND profile=?", (update.effective_user.id, prof)); conn.commit(); conn.close()
-    await update.callback_query.edit_message_text(f"✅ Удалены все подписки профиля «{prof}».", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")]]))
+    await safe_edit_message(update.callback_query, f"✅ Удалены все подписки профиля «{prof}».",
+                            InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")]]))
 
-#ПОДПИСКА
+# ===================== ПОДПИСКА =====================
 async def show_profiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
     olys = context.user_data['olys']
     profiles = get_profiles(olys)
@@ -440,8 +496,12 @@ async def show_profiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb.append([InlineKeyboardButton("Готово", callback_data="profiles_done")])
     kb.append([InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")])
     markup = InlineKeyboardMarkup(kb)
-    if update.callback_query: await update.callback_query.edit_message_text("Выберите профиль(и):", reply_markup=markup)
-    else:                     await update.message.reply_text("Выберите профиль(и):", reply_markup=markup)
+    if update.callback_query:
+        context.user_data[UD_ACTIVE_MSG_ID] = update.callback_query.message.message_id
+        await safe_edit_message(update.callback_query, "Выберите профиль(и):", markup)
+    else:
+        m = await update.message.reply_text("Выберите профиль(и):", reply_markup=markup)
+        context.user_data[UD_ACTIVE_MSG_ID] = m.message_id
 
 async def toggle_profile_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
@@ -467,7 +527,7 @@ async def ask_profile_option(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton("Выбрать вручную", callback_data="include_manual")],
         [InlineKeyboardButton("↩️ Главное меню",  callback_data="menu_back")],
     ]
-    await update.callback_query.edit_message_text(f"Профиль: {prof}. Учитывать все олимпиады этого профиля?", reply_markup=InlineKeyboardMarkup(kb))
+    await safe_edit_message(update.callback_query, f"Профиль: {prof}. Учитывать все олимпиады этого профиля?", InlineKeyboardMarkup(kb))
 
 async def include_all_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
@@ -489,7 +549,7 @@ async def show_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
           for i, o in enumerate(olys)]
     kb.append([InlineKeyboardButton("Готово", callback_data="manual_done")])
     kb.append([InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")])
-    await update.callback_query.edit_message_text("Выберите олимпиады вручную:", reply_markup=InlineKeyboardMarkup(kb))
+    await safe_edit_message(update.callback_query, "Выберите олимпиады вручную:", InlineKeyboardMarkup(kb))
 
 async def toggle_oly_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
@@ -520,9 +580,11 @@ async def proceed_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.execute("INSERT OR IGNORE INTO subscriptions (user_id, olympiad_id, olympiad_name, profile) VALUES (?,?,?,?)",
                     (uid, o['id'], o['name'], prof))
     conn.commit(); conn.close()
-    await update.callback_query.edit_message_text(f"✅ Подписки сохранены. Напоминания — в {DAILY_NOTIFY_TIME} по МСК." , reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")]]))
+    await safe_edit_message(update.callback_query,
+                            f"✅ Подписки сохранены. Напоминания — в {DAILY_NOTIFY_TIME} по МСК.",
+                            InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Главное меню", callback_data="menu_back")]]))
 
-#НАПОМИНАНИЯ
+# ===================== НАПОМИНАНИЯ =====================
 def chunk_messages(lines: Iterable[str], max_len=MAX_MESSAGE_LENGTH) -> List[str]:
     chunks, cur = [], ""
     for ln in lines:
@@ -579,7 +641,7 @@ async def send_daily(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-#Админ: ручной прогон прямо сейчас
+# ===================== Админ: ручной прогон прямо сейчас =====================
 async def test_notify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Только для админа."); return
@@ -596,13 +658,13 @@ async def test_notify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     lines = build_user_reminders(lookup, items, today)
-    if lines:
+    if lines and lines != ["🔔 Напоминание:"]:
         for ch in chunk_messages(lines):
             await update.message.reply_text("🧪 TEST:\n\n" + ch)
     else:
         await update.message.reply_text("🧪 TEST: Сегодня напоминаний бы не было по текущей политике.")
 
-#АДМИН-РАССЫЛКА
+# ===================== АДМИН-РАССЫЛКА =====================
 def split_text(text: str, max_len=MAX_MESSAGE_LENGTH) -> List[str]:
     if len(text) <= max_len: return [text]
     chunks, cur = [], ""
@@ -652,7 +714,7 @@ async def do_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
             failed += 1
     await context.bot.send_message(chat_id=admin_chat, text=f"✅ Рассылка завершена.\nПолучателей: {len(user_ids)}\nУспешно: {sent}\nОшибок: {failed}")
 
-#ПРОЧЕЕ
+# ===================== ПРОЧЕЕ =====================
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Неизвестная команда. Напишите /start.")
 
@@ -663,9 +725,9 @@ async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logging.error("Ошибка при обработке обновления:", exc_info=context.error)
 
-#FALLBACK-ПЛАНИРОВЩИК
+# ===================== FALLBACK-ПЛАНИРОВЩИК =====================
 async def fallback_daily_scheduler(app: Application, notify_tm: time):
-    """Если JobQueue недоступен — выполняем send_daily ежедневно в указанное время."""
+    """Если JobQueue недоступен — отправляем send_daily ежедневно в указанное время."""
     class DummyCtx:
         def __init__(self, bot): self.bot = bot
 
@@ -689,7 +751,7 @@ async def _post_init(app: Application):
     else:
         logging.info("JobQueue доступен — используется стандартный планировщик.")
 
-#ЗАПУСК
+# ===================== ЗАПУСК =====================
 def main():
     logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
     init_db()
@@ -742,6 +804,4 @@ def main():
         logging.error("Запуск не удался: другой экземпляр бота уже запущен.")
 
 if __name__ == "__main__":
-
     main()
-
