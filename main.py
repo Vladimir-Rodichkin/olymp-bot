@@ -34,7 +34,7 @@ from telegram.ext import (
 from telegram.error import Conflict, Forbidden, BadRequest
 
 #Конфигурация
-TELEGRAM_TOKEN    = '8423749506:AAGmDjL7bjopLITZE1XCyeMB_W--byMuYwk'
+TELEGRAM_TOKEN    = 'TOKEN'
 EXCEL_FILE        = "Список олимпиад.xlsx"
 DB_FILE           = 'subscriptions.db'
 TIMEZONE            = ZoneInfo('Europe/Moscow')
@@ -742,4 +742,5 @@ def main():
         logging.error("Запуск не удался: другой экземпляр бота уже запущен.")
 
 if __name__ == "__main__":
+
     main()
