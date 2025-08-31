@@ -58,7 +58,7 @@ GOOGLE_SHEET_LINK   = (
 MAX_MESSAGE_LENGTH  = 4000  # безопасная длина (поскольку в тг есть ограничения на количество текста в одном сообщении)
 
 # Админы (для /broadcast и /testnotify)
-ADMIN_IDS           = {574218973}
+ADMIN_IDS           = {}
 
 # Ключи
 UD_LIST_ROOT_ID     = 'list_root_msg_id'
@@ -744,3 +744,4 @@ def main():
 if __name__ == "__main__":
 
     main()
+
