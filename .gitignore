@@ -1,0 +1,17 @@
+# Секреты
+.env
+
+# Рантайм-данные бота
+subscriptions.db
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
